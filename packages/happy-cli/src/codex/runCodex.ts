@@ -752,14 +752,14 @@ export async function runCodex(opts: {
             }
         }
 
-        if (msg.type === 'task_started') {
+        if (msg.type === 'task_started' && !isSubagentScopedEvent) {
             if (!thinking) {
                 logger.debug('thinking started');
                 thinking = true;
                 session.keepAlive(thinking, 'remote');
             }
         }
-        if (msg.type === 'task_complete' || msg.type === 'turn_aborted') {
+        if (!isSubagentScopedEvent && (msg.type === 'task_complete' || msg.type === 'turn_aborted')) {
             // Flush buffered output while the completing turn still owns it.
             reasoningProcessor.abort();
             if (thinking) {
@@ -831,7 +831,7 @@ export async function runCodex(opts: {
             codexCollabReceiverThreadIdsByCall = mapped.collabReceiverThreadIdsByCall;
             codexCollabToolByCall = mapped.collabToolByCall;
             publishMappedMessages(mapped);
-            if (msg.type === 'task_complete' || msg.type === 'turn_aborted') {
+            if (!isSubagentScopedEvent && (msg.type === 'task_complete' || msg.type === 'turn_aborted')) {
                 turnFinalizer.completed();
             }
         }

@@ -245,6 +245,7 @@ export class CodexAppServerClient {
     private pendingInterrupt: Promise<void> | null = null;
     private notificationProtocol: 'unknown' | 'legacy' | 'raw' = 'unknown';
     private completedTurnIds = new Set<string>();
+    private rawCompletedItemIds = new Set<string>();
     private rawFileChangesByItemId = new Map<string, LegacyPatchChanges>();
     private rawSubagentActivitySignaturesByItemId = new Map<string, Set<string>>();
     // Approval callIds currently awaiting an answer. One codex item can raise
@@ -335,6 +336,9 @@ export class CodexAppServerClient {
         error: unknown,
         source: string,
     ): void {
+        const activeTurnId = this.pendingTurnCompletion?.turnId ?? this._turnId;
+        if (activeTurnId && turnId && activeTurnId !== turnId) return;
+
         const aborted = status === 'cancelled' || status === 'canceled' || status === 'aborted' || status === 'interrupted';
 
         this.tryResolvePendingTurn(aborted, turnId, source);
@@ -370,13 +374,46 @@ export class CodexAppServerClient {
             return false;
         }
 
+        const threadId = stringOrNull(params?.threadId);
+        const subagent = threadId && this._threadId && threadId !== this._threadId ? threadId : undefined;
+        const emit = (event: EventMsg) => this.eventHandler?.({ ...event, ...(subagent ? { subagent } : {}) });
+        const complete = (turnId: string | null, status: string | null, error: unknown, source: string) => {
+            if (!subagent) {
+                this.emitRawTurnCompletion(turnId, status, error, source);
+                return;
+            }
+            // Child turns must never resolve or replace the parent's active turn.
+            if (turnId && this.completedTurnIds.has(turnId)) return;
+            if (turnId) this.completedTurnIds.add(turnId);
+            const aborted = ['cancelled', 'canceled', 'aborted', 'interrupted'].includes(status ?? '');
+            emit({ type: aborted ? 'turn_aborted' : 'task_complete', turn_id: turnId, status, ...(error ? { error } : {}) });
+        };
+
+        const turnId = this.extractTurnId(params);
+        const activeTurnId = this.pendingTurnCompletion?.turnId
+            ?? (method === 'turn/started' ? null : this._turnId);
+        if (this._threadId && !subagent && turnId && activeTurnId && turnId !== activeTurnId) return true;
+        const itemId = stringOrNull(params?.item?.id);
+        const itemKey = itemId ? formatScopedItemKey(threadId ?? this._threadId, itemId) : null;
+        const itemEvent = (method === 'item/started' || method === 'item/completed')
+            && params?.item?.type !== 'subAgentActivity';
+        if (itemEvent && itemKey && this.rawCompletedItemIds.has(itemKey)) return true;
+        if (itemEvent && method === 'item/completed' && itemKey) this.rawCompletedItemIds.add(itemKey);
+        if (turnId && (method === 'turn/started' || (itemEvent && itemId))) {
+            // Codex can resume a completed turn after a late background result.
+            // New output reopens completion delivery; transport duplicates do not.
+            this.completedTurnIds.delete(turnId);
+            if (!subagent) this._turnId = turnId;
+        }
+        if (subagent && (method.startsWith('thread/goal/') || method === 'thread/tokenUsage/updated')) return true;
+
         if (method === 'turn/started') {
             const turnId = this.extractTurnId(params);
-            if (turnId) {
-                this._turnId = turnId;
+            if (!subagent) {
+                if (turnId) this._turnId = turnId;
+                this.markPendingTurnStarted(turnId);
             }
-            this.markPendingTurnStarted(turnId);
-            this.eventHandler?.({
+            emit({
                 type: 'task_started',
                 ...(turnId ? { turn_id: turnId } : {}),
             });
@@ -384,7 +421,7 @@ export class CodexAppServerClient {
         }
 
         if (method === 'turn/completed') {
-            this.emitRawTurnCompletion(
+            complete(
                 this.extractTurnId(params),
                 this.extractTurnStatus(params),
                 params?.turn?.error ?? params?.error,
@@ -395,8 +432,8 @@ export class CodexAppServerClient {
 
         if (method === 'thread/status/changed') {
             const statusType = params?.status?.type;
-            if (statusType === 'idle' && this.pendingTurnCompletion) {
-                this.emitRawTurnCompletion(this._turnId, 'completed', null, method);
+            if (!subagent && statusType === 'idle' && (this.pendingTurnCompletion || this._turnId)) {
+                complete(this._turnId, 'completed', null, method);
             }
             return true;
         }
@@ -406,7 +443,7 @@ export class CodexAppServerClient {
                 ? params.threadId
                 : (typeof params?.goal?.threadId === 'string' ? params.goal.threadId : undefined);
             const turnId = typeof params?.turnId === 'string' ? params.turnId : null;
-            this.eventHandler?.({
+            emit({
                 type: 'thread_goal_updated',
                 ...(threadId ? { thread_id: threadId, threadId } : {}),
                 ...(turnId ? { turn_id: turnId, turnId } : {}),
@@ -417,7 +454,7 @@ export class CodexAppServerClient {
 
         if (method === 'thread/goal/cleared') {
             const threadId = typeof params?.threadId === 'string' ? params.threadId : undefined;
-            this.eventHandler?.({
+            emit({
                 type: 'thread_goal_cleared',
                 ...(threadId ? { thread_id: threadId, threadId } : {}),
             });
@@ -427,7 +464,7 @@ export class CodexAppServerClient {
         if (method === 'thread/tokenUsage/updated') {
             const tokenUsage = params?.tokenUsage;
             if (tokenUsage && typeof tokenUsage === 'object') {
-                this.eventHandler?.({
+                emit({
                     type: 'token_count',
                     ...tokenUsage,
                 });
@@ -445,7 +482,7 @@ export class CodexAppServerClient {
             // Scoped the same way as the approval request for this item, so
             // the app can attach the permission card to the tool call.
             const callId = itemId ? formatScopedItemKey(stringOrNull(params?.threadId) ?? this._threadId, itemId) : '';
-            this.eventHandler?.({
+            emit({
                 type: 'exec_command_begin',
                 call_id: callId,
                 callId,
@@ -459,7 +496,7 @@ export class CodexAppServerClient {
         if (method === 'item/completed' && item.type === 'commandExecution') {
             const itemId = typeof item.id === 'string' ? item.id : '';
             const callId = itemId ? formatScopedItemKey(stringOrNull(params?.threadId) ?? this._threadId, itemId) : '';
-            this.eventHandler?.({
+            emit({
                 type: 'exec_command_end',
                 call_id: callId,
                 callId,
@@ -484,7 +521,7 @@ export class CodexAppServerClient {
             }
 
             if (method === 'item/started') {
-                this.eventHandler?.({
+                emit({
                     type: 'patch_apply_begin',
                     call_id: itemKey,
                     callId: itemKey,
@@ -494,7 +531,7 @@ export class CodexAppServerClient {
             }
 
             if (method === 'item/completed') {
-                this.eventHandler?.({
+                emit({
                     type: 'patch_apply_end',
                     call_id: itemKey,
                     callId: itemKey,
@@ -528,7 +565,7 @@ export class CodexAppServerClient {
             };
 
             if (method === 'item/started') {
-                this.eventHandler?.({
+                emit({
                     type: 'collab_agent_begin',
                     ...payload,
                 });
@@ -536,7 +573,7 @@ export class CodexAppServerClient {
             }
 
             if (method === 'item/completed') {
-                this.eventHandler?.({
+                emit({
                     type: 'collab_agent_end',
                     ...payload,
                 });
@@ -565,7 +602,7 @@ export class CodexAppServerClient {
                     signatures.add(signature);
                     this.rawSubagentActivitySignaturesByItemId.set(itemKey, signatures);
                 }
-                this.eventHandler?.({
+                emit({
                     type: 'subagent_activity',
                     item_id: item.id,
                     kind: item.kind,
@@ -581,7 +618,7 @@ export class CodexAppServerClient {
         if (method === 'item/completed' && item.type === 'agentMessage') {
             const text = typeof item.text === 'string' ? item.text : '';
             if (text.length > 0) {
-                this.eventHandler?.({
+                emit({
                     type: 'agent_message',
                     message: text,
                     item_id: item.id,
@@ -589,8 +626,8 @@ export class CodexAppServerClient {
                 });
             }
 
-            if (item.phase === 'final_answer' && this.pendingTurnCompletion) {
-                this.emitRawTurnCompletion(
+            if (item.phase === 'final_answer') {
+                complete(
                     this.extractTurnId(params),
                     'completed',
                     null,
@@ -751,6 +788,7 @@ export class CodexAppServerClient {
         this._turnId = null;
         this.notificationProtocol = 'unknown';
         this.completedTurnIds.clear();
+        this.rawCompletedItemIds.clear();
         if (!opts?.preserveThreadState) {
             this._threadId = null;
             this.threadDefaults = null;
@@ -1231,6 +1269,7 @@ export class CodexAppServerClient {
         this._turnId = null;
         this.threadDefaults = null;
         this.completedTurnIds.clear();
+        this.rawCompletedItemIds.clear();
         this.rawFileChangesByItemId.clear();
         this.rawSubagentActivitySignaturesByItemId.clear();
     }

@@ -1820,6 +1820,108 @@ describe('CodexAppServerClient sandbox integration', () => {
         await client.disconnect();
     });
 
+    it.each(['turn/completed', 'final_answer'])('ends a resumed same-turn continuation via %s', async (completion) => {
+        const proc = createMockProcess({ onRequest: (msg, stdout) => {
+            if (msg.method === 'thread/start') pushJsonLine(stdout, { id: msg.id, result: { thread: { id: 'root' }, model: 'test' } });
+            if (msg.method === 'turn/start') {
+                pushJsonLine(stdout, { id: msg.id, result: { turn: { id: 'turn-root' } } });
+                pushJsonLine(stdout, { method: 'turn/started', params: { threadId: 'root', turn: { id: 'turn-root' } } });
+                pushJsonLine(stdout, { method: 'item/completed', params: { threadId: 'root', turnId: 'turn-root', item: { id: 'first', type: 'agentMessage', text: 'Initial answer', phase: 'final_answer' } } });
+            }
+        } });
+        mockSpawn.mockImplementation(() => proc);
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        const events: Array<Record<string, unknown>> = [];
+        client.setEventHandler((event) => events.push(event));
+        await client.connect();
+        await client.startThread({ model: 'test', cwd: '/tmp', approvalPolicy: 'never', sandbox: 'danger-full-access' });
+        try {
+            await client.sendTurnAndWait('work');
+            expect(events.filter((event) => event.type === 'task_complete')).toHaveLength(1);
+            // A late agent result resumes the same provider turn, with no new turn/started.
+            pushJsonLine(proc.stdout, { method: 'item/started', params: { threadId: 'root', turnId: 'turn-root', item: { id: 'continued', type: 'commandExecution', command: 'true' } } });
+            pushJsonLine(proc.stdout, { method: 'item/completed', params: { threadId: 'root', turnId: 'turn-root', item: { id: 'continued', type: 'commandExecution', command: 'true', exitCode: 0 } } });
+            if (completion === 'final_answer') {
+                pushJsonLine(proc.stdout, { method: 'item/completed', params: { threadId: 'root', turnId: 'turn-root', item: { id: 'second', type: 'agentMessage', text: 'Final answer', phase: 'final_answer' } } });
+                await new Promise((resolve) => setTimeout(resolve, 20));
+                expect(events.filter((event) => event.type === 'task_complete')).toHaveLength(2);
+            }
+            pushJsonLine(proc.stdout, { method: 'turn/completed', params: { threadId: 'root', turn: { id: 'turn-root', status: 'completed' } } });
+            // A repeated transport notification still must not create extra completion events.
+            pushJsonLine(proc.stdout, { method: 'turn/completed', params: { threadId: 'root', turn: { id: 'turn-root', status: 'completed' } } });
+            await new Promise((resolve) => setTimeout(resolve, 20));
+            expect(events.filter((event) => event.type === 'task_complete')).toHaveLength(2);
+        } finally { await client.disconnect(); }
+    });
+
+    it('keeps child thread lifecycle and output scoped without finishing the parent waiter', async () => {
+        const proc = createMockProcess({ onRequest: (msg, stdout) => {
+            if (msg.method === 'thread/start') pushJsonLine(stdout, { id: msg.id, result: { thread: { id: 'root' }, model: 'test' } });
+            if (msg.method === 'turn/start') {
+                pushJsonLine(stdout, { id: msg.id, result: { turn: { id: 'parent-turn' } } });
+                pushJsonLine(stdout, { method: 'turn/started', params: { threadId: 'root', turn: { id: 'parent-turn' } } });
+            }
+        } });
+        mockSpawn.mockImplementation(() => proc);
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        const events: Array<Record<string, unknown>> = [];
+        client.setEventHandler((event) => events.push(event));
+        await client.connect();
+        await client.startThread({ model: 'test', cwd: '/tmp', approvalPolicy: 'never', sandbox: 'danger-full-access' });
+        let settled = false;
+        const pending = client.sendTurnAndWait('work').then((result) => { settled = true; return result; });
+        try {
+            await waitFor(() => events.some((event) => event.type === 'task_started'));
+            pushJsonLine(proc.stdout, { method: 'turn/started', params: { threadId: 'child', turn: { id: 'child-turn' } } });
+            pushJsonLine(proc.stdout, { method: 'item/completed', params: { threadId: 'child', turnId: 'child-turn', item: { id: 'child-answer', type: 'agentMessage', text: 'Child result', phase: 'final_answer' } } });
+            pushJsonLine(proc.stdout, { method: 'thread/status/changed', params: { threadId: 'child', status: { type: 'idle' } } });
+            pushJsonLine(proc.stdout, { method: 'turn/completed', params: { threadId: 'child', turn: { id: 'child-turn', status: 'completed' } } });
+            await new Promise((resolve) => setTimeout(resolve, 20));
+            expect(settled).toBe(false);
+            expect(client.turnId).toBe('parent-turn');
+            expect(events).toContainEqual(expect.objectContaining({ type: 'agent_message', message: 'Child result', subagent: 'child' }));
+            expect(events.filter((event) => event.type === 'task_complete' && !event.subagent)).toHaveLength(0);
+            pushJsonLine(proc.stdout, { method: 'turn/completed', params: { threadId: 'root', turn: { id: 'parent-turn', status: 'completed' } } });
+            await expect(pending).resolves.toEqual({ aborted: false });
+        } finally { await client.disconnect(); await pending; }
+    });
+
+    it('ignores late output and completion from an older turn while a new turn is active', async () => {
+        let turn = 0;
+        const proc = createMockProcess({ onRequest: (msg, stdout) => {
+            if (msg.method === 'thread/start') pushJsonLine(stdout, { id: msg.id, result: { thread: { id: 'root' }, model: 'test' } });
+            if (msg.method === 'turn/start') {
+                const id = `turn-${++turn}`;
+                pushJsonLine(stdout, { id: msg.id, result: { turn: { id } } });
+                pushJsonLine(stdout, { method: 'turn/started', params: { threadId: 'root', turn: { id } } });
+                if (turn === 1) pushJsonLine(stdout, { method: 'turn/completed', params: { threadId: 'root', turn: { id, status: 'completed' } } });
+            }
+        } });
+        mockSpawn.mockImplementation(() => proc);
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        const events: Array<Record<string, unknown>> = [];
+        client.setEventHandler((event) => events.push(event));
+        await client.connect();
+        await client.startThread({ model: 'test', cwd: '/tmp', approvalPolicy: 'never', sandbox: 'danger-full-access' });
+        await client.sendTurnAndWait('first');
+        let settled = false;
+        const second = client.sendTurnAndWait('second').then((result) => { settled = true; return result; });
+        try {
+            await waitFor(() => client.turnId === 'turn-2');
+            pushJsonLine(proc.stdout, { method: 'item/started', params: { threadId: 'root', turnId: 'turn-1', item: { id: 'late', type: 'commandExecution', command: 'true' } } });
+            pushJsonLine(proc.stdout, { method: 'turn/completed', params: { threadId: 'root', turn: { id: 'turn-1', status: 'completed' } } });
+            await new Promise((resolve) => setTimeout(resolve, 20));
+            expect(settled).toBe(false);
+            expect(client.turnId).toBe('turn-2');
+            expect(events.filter((event) => event.type === 'task_complete')).toHaveLength(1);
+            pushJsonLine(proc.stdout, { method: 'turn/completed', params: { threadId: 'root', turn: { id: 'turn-2', status: 'completed' } } });
+            await expect(second).resolves.toEqual({ aborted: false });
+        } finally { await client.disconnect(); await second; }
+    });
+
     it('responds to MCP elicitation requests with an action payload', async () => {
         const approvals: Array<Record<string, unknown>> = [];
         const requests: MockRpcMessage[] = [];
