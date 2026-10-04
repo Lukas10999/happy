@@ -70,7 +70,7 @@ const MAINTAIN_VISIBLE_CONTENT_POSITION = {
      * deliberately back in history, and the points in between are mostly the
      * bottom row growing as it streams.
      */
-    autoscrollToTopThreshold: 200,
+    autoscrollToTopThreshold: 50,
 } as const;
 /**
  * How much history the list renders on open, and how much more it renders each
@@ -94,7 +94,7 @@ const WINDOW_PAGE = 60;
  */
 const START_REACHED_VIEWPORTS = 1;
 /** Stop automatic paging after this many pages that reach no further back (see oldestBoundary). */
-const MAX_INVISIBLE_OLDER_PAGES = 5;
+const MAX_INVISIBLE_OLDER_PAGES = 50;
 // Visual gap between the button's bottom edge and the composer card's top
 // edge. scrollButtonInset is measured to the card itself, so this is exact.
 const SCROLL_BUTTON_COMPOSER_GAP = 16;

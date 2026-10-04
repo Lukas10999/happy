@@ -390,25 +390,25 @@ describe('ChatList automatic history', () => {
         expect(page.started()).toBe(2);
     });
 
-    it('pauses after five invisible pages until the reader explicitly loads more', async () => {
+    it('pauses after fifty invisible pages until the reader explicitly loads more', async () => {
         const renderer = open(thinking(600));
         const page = pendingPage();
         layout(renderer, { content: 40 });
         expect(page.started()).toBe(1);
-        for (let index = 1; index <= 5; index++) {
+        for (let index = 1; index <= 50; index++) {
             await settle(renderer, thinking(600 + index * 100), true, page.finish);
         }
-        expect(page.started()).toBe(5);
+        expect(page.started()).toBe(50);
         expect(renderer.root.findByType('RoundButton').props.title).toBe('common.loadMore');
         scroll(renderer, 10); scroll(renderer, 20);
-        expect(page.started()).toBe(5);
-        state.messages = [...thinking(1100), userMessage('background-visible', 1)];
+        expect(page.started()).toBe(50);
+        state.messages = [...thinking(5600), userMessage('background-visible', 1)];
         state.hasMoreOlder = true;
         renderChat(renderer);
-        expect(page.started()).toBe(5);
+        expect(page.started()).toBe(50);
         expect(renderer.root.findByType('RoundButton').props.title).toBe('common.loadMore');
         act(() => renderer.root.findByType('RoundButton').props.onPress());
-        expect(page.started()).toBe(6);
+        expect(page.started()).toBe(51);
     });
 
     it('stops when sync reports history exhausted, even with nothing rendered', async () => {
@@ -428,12 +428,12 @@ describe('ChatList automatic history', () => {
         renderChat(renderer);
         const page = pendingPage();
         layout(renderer, { content: 40 });
-        for (let index = 1; index <= 5; index++) {
+        for (let index = 1; index <= 50; index++) {
             live.unshift(agentMessage(`live-${index}`, 900 + index));
             await settle(renderer, [...live, ...thinking(600 + index * 100)], true, page.finish);
         }
-        expect(messageIds(renderer)).toHaveLength(6);
-        expect(page.started()).toBe(5);
+        expect(messageIds(renderer)).toHaveLength(51);
+        expect(page.started()).toBe(50);
         expect(renderer.root.findByType('RoundButton').props.title).toBe('common.loadMore');
     });
 
@@ -442,14 +442,14 @@ describe('ChatList automatic history', () => {
         const renderer = open([...visible, ...thinking(600)]);
         const page = pendingPage();
         layout(renderer, { content: 40 });
-        for (let index = 1; index <= 5; index++) {
-            if (index === 5) {
+        for (let index = 1; index <= 50; index++) {
+            if (index === 50) {
                 act(() => renderer.root.findByType('AgentWorkGroupHeader').props.onToggle());
                 expect(messageIds(renderer)).toContain('tool');
             }
             await settle(renderer, [...visible, ...thinking(600 + index * 100)], true, page.finish);
         }
-        expect(page.started()).toBe(5);
+        expect(page.started()).toBe(50);
         expect(renderer.root.findByType('RoundButton').props.title).toBe('common.loadMore');
     });
 
@@ -458,19 +458,19 @@ describe('ChatList automatic history', () => {
         const renderer = open([...visible, ...thinking(600)]);
         const page = pendingPage();
         layout(renderer, { content: 40 });
-        for (let index = 1; index <= 4; index++) {
+        for (let index = 1; index <= 49; index++) {
             await settle(renderer, [...visible, ...thinking(600 + index * 100)], true, page.finish);
         }
         // One newer row disappears while an older visible row arrives: total
         // row count is unchanged, but the reader has made progress into history.
-        const progressed = [visible[1], ...thinking(1100), userMessage('older', -1000)];
+        const progressed = [visible[1], ...thinking(5600), userMessage('older', -10000)];
         await settle(renderer, progressed, true, page.finish);
         expect(messageIds(renderer)).toEqual(['oldest', 'older']);
-        expect(page.started()).toBe(6);
-        for (let index = 1; index <= 5; index++) {
-            await settle(renderer, [...progressed, ...thinking(index * 100, -1001)], true, page.finish);
+        expect(page.started()).toBe(51);
+        for (let index = 1; index <= 50; index++) {
+            await settle(renderer, [...progressed, ...thinking(index * 100, -10001)], true, page.finish);
         }
-        expect(page.started()).toBe(10);
+        expect(page.started()).toBe(100);
         expect(renderer.root.findByType('RoundButton').props.title).toBe('common.loadMore');
     });
 
