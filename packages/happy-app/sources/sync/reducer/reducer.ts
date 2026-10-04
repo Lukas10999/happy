@@ -712,7 +712,14 @@ export function reducer(state: ReducerState, messages: NormalizedMessage[], agen
 
                         // Update tool state based on permission status
                         if (completed.status === 'approved') {
-                            if (message.tool.state !== 'completed' && message.tool.state !== 'error' && message.tool.state !== 'running') {
+                            // Codex questions are synthetic permission calls: approval
+                            // resolves them without a later provider tool-result.
+                            if (completed.tool === 'AskUserQuestion' && completed.arguments?.provider === 'codex'
+                                && message.tool.state !== 'completed' && message.tool.state !== 'error') {
+                                message.tool.state = 'completed';
+                                message.tool.completedAt = completed.completedAt || Date.now();
+                                hasChanged = true;
+                            } else if (message.tool.state !== 'completed' && message.tool.state !== 'error' && message.tool.state !== 'running') {
                                 message.tool.state = 'running';
                                 hasChanged = true;
                             }

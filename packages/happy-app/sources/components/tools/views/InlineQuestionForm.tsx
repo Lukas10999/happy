@@ -1,5 +1,5 @@
 import * as React from 'react';
-import { ActivityIndicator, Platform, Text, TouchableOpacity, View } from 'react-native';
+import { ActivityIndicator, Platform, Text, TextInput, TouchableOpacity, View } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { StyleSheet, useUnistyles } from 'react-native-unistyles';
 
@@ -18,6 +18,8 @@ export interface InlineQuestion {
     options: InlineQuestionOption[];
     multiSelect?: boolean | null;
     required?: boolean | null;
+    allowTextAnswer?: boolean;
+    isSecret?: boolean;
 }
 
 export type InlineQuestionAnswers = Record<string, string[]>;
@@ -36,12 +38,14 @@ export const InlineQuestionForm = React.memo<InlineQuestionFormProps>((props) =>
     const { questions, onSubmit } = props;
     const { theme } = useUnistyles();
     const [selections, setSelections] = React.useState<Map<string, Set<number>>>(new Map());
+    const [customAnswers, setCustomAnswers] = React.useState<Map<string, string>>(new Map());
     const [isSubmitting, setIsSubmitting] = React.useState(false);
     const [locallySubmittedAnswers, setLocallySubmittedAnswers] = React.useState<InlineQuestionAnswers | null>(null);
     const questionKey = questions.map(question => question.id).join('\u0000');
 
     React.useEffect(() => {
         setSelections(new Map());
+        setCustomAnswers(new Map());
         setLocallySubmittedAnswers(null);
         setIsSubmitting(false);
     }, [questionKey]);
@@ -50,12 +54,14 @@ export const InlineQuestionForm = React.memo<InlineQuestionFormProps>((props) =>
     const canInteract = props.canInteract && submittedAnswers === null;
     const allQuestionsAnswered = questions.every((question) => {
         if (question.required === false) return true;
-        return (selections.get(question.id)?.size ?? 0) > 0;
+        return (selections.get(question.id)?.size ?? 0) > 0
+            || (question.allowTextAnswer && Boolean(customAnswers.get(question.id)?.trim()));
     });
 
     const handleOptionToggle = React.useCallback((question: InlineQuestion, optionIndex: number) => {
         if (!canInteract) return;
 
+        setCustomAnswers(previous => new Map(previous).set(question.id, ''));
         setSelections(previous => {
             const next = new Map(previous);
             const current = previous.get(question.id) ?? new Set<number>();
@@ -75,10 +81,15 @@ export const InlineQuestionForm = React.memo<InlineQuestionFormProps>((props) =>
     }, [canInteract]);
 
     const handleSubmit = React.useCallback(async () => {
-        if (!allQuestionsAnswered || isSubmitting) return;
+        if (!canInteract || !allQuestionsAnswered || isSubmitting) return;
 
-        const answers: InlineQuestionAnswers = {};
+        const answers: InlineQuestionAnswers = Object.create(null);
         for (const question of questions) {
+            const customAnswer = customAnswers.get(question.id);
+            if (question.allowTextAnswer && customAnswer?.trim()) {
+                answers[question.id] = [customAnswer];
+                continue;
+            }
             const selected = selections.get(question.id);
             if (!selected || selected.size === 0) continue;
             answers[question.id] = Array.from(selected)
@@ -96,20 +107,27 @@ export const InlineQuestionForm = React.memo<InlineQuestionFormProps>((props) =>
         } finally {
             setIsSubmitting(false);
         }
-    }, [allQuestionsAnswered, isSubmitting, onSubmit, questions, selections]);
+    }, [canInteract, allQuestionsAnswered, isSubmitting, onSubmit, questions, selections, customAnswers]);
 
     if (submittedAnswers) {
         return (
             <ToolSectionView>
                 <View style={styles.submittedContainer}>
-                    {questions.map(question => (
-                        <View key={question.id} style={styles.submittedItem}>
-                            <Text style={styles.submittedHeader}>{question.header}:</Text>
-                            <Text style={styles.submittedValue}>
-                                {submittedAnswers[question.id]?.join(', ') || '—'}
-                            </Text>
-                        </View>
-                    ))}
+                    {questions.map(question => {
+                        const answer = Object.prototype.hasOwnProperty.call(submittedAnswers, question.id)
+                            ? submittedAnswers[question.id]
+                            : undefined;
+                        return (
+                            <View key={question.id} style={styles.submittedItem}>
+                                <Text style={styles.submittedHeader}>{question.header}:</Text>
+                                <Text style={styles.submittedValue}>
+                                    {question.isSecret && answer?.length
+                                        ? '••••••••'
+                                        : answer?.join(', ') || '—'}
+                                </Text>
+                            </View>
+                        );
+                    })}
                 </View>
             </ToolSectionView>
         );
@@ -166,6 +184,28 @@ export const InlineQuestionForm = React.memo<InlineQuestionFormProps>((props) =>
                                     );
                                 })}
                             </View>
+                            {question.allowTextAnswer && (
+                                <TextInput
+                                    accessibilityLabel={question.question}
+                                    style={styles.customInput}
+                                    placeholder={t('tools.askUserQuestion.otherPlaceholder')}
+                                    placeholderTextColor={theme.colors.textSecondary}
+                                    value={customAnswers.get(question.id) ?? ''}
+                                    editable={canInteract}
+                                    secureTextEntry={question.isSecret === true}
+                                    autoCorrect={!question.isSecret}
+                                    autoCapitalize={question.isSecret ? 'none' : 'sentences'}
+                                    onChangeText={(value) => {
+                                        if (!canInteract) return;
+                                        setCustomAnswers(previous => new Map(previous).set(question.id, value));
+                                        setSelections(previous => {
+                                            const next = new Map(previous);
+                                            next.delete(question.id);
+                                            return next;
+                                        });
+                                    }}
+                                />
+                            )}
                         </View>
                     );
                 })}
@@ -293,6 +333,16 @@ const styles = StyleSheet.create((theme) => ({
         fontSize: 13,
         color: theme.colors.textSecondary,
         marginTop: 2,
+    },
+    customInput: {
+        borderWidth: 1,
+        borderColor: theme.colors.divider,
+        borderRadius: 8,
+        paddingHorizontal: 12,
+        paddingVertical: 12,
+        minHeight: 44,
+        color: theme.colors.text,
+        fontSize: 14,
     },
     actionsContainer: {
         flexDirection: 'row',
