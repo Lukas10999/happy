@@ -1,3 +1,4 @@
+import { publishCodexMessages, createCodexTurnFinalizer } from './utils/publishCodexMessages';
 import { render } from "ink";
 import React from "react";
 import { ApiClient } from '@/api/api';
@@ -348,8 +349,39 @@ export async function runCodex(opts: {
         });
     });
     session.onUserMessage(handleUserMessage);
+    let pending: { message: string; mode: EnhancedMode; isolate: boolean; hash: string; attachments?: PendingAttachment[] } | null = null;
     let thinking = false;
     let currentTurnId: string | null = null;
+    const turnFinalizer = createCodexTurnFinalizer(() => currentTurnId, () => {
+        permissionHandler.reset();
+        diffProcessor.reset();
+        activeTurnPermissionMode = undefined;
+        thinking = false;
+        session.keepAlive(thinking, 'remote');
+        emitReadyIfIdle({
+            pending,
+            queueSize: () => messageQueue.size(),
+            shouldExit,
+            sendReady,
+    });
+    }, () => {
+        reasoningProcessor?.abort();
+        currentTurnId = null;
+    });
+
+    const publishMappedMessages = (mapped: Parameters<typeof publishCodexMessages>[0]) => {
+        publishCodexMessages(mapped, {
+            onTurnChanged: (turnId) => {
+                currentTurnId = turnId;
+                const active = turnId !== null;
+                if (thinking !== active) {
+                    thinking = active;
+                    session.keepAlive(thinking, 'remote');
+                }
+            },
+            send: (envelope) => session.sendSessionProtocolMessage(envelope),
+        });
+    };
     let codexStartedSubagents = new Set<string>();
     let codexActiveSubagents = new Set<string>();
     let codexProviderSubagentToSessionSubagent = new Map<string, string>();
@@ -562,17 +594,11 @@ export async function runCodex(opts: {
     permissionHandler.reset('Previous CLI process exited before responding');
     reasoningProcessor = new ReasoningProcessor((message) => {
         const mapped = mapCodexProcessorMessageToSessionEnvelopes(message, { currentTurnId });
-        currentTurnId = mapped.currentTurnId;
-        for (const envelope of mapped.envelopes) {
-            session.sendSessionProtocolMessage(envelope);
-        }
+        publishMappedMessages(mapped);
     });
     const diffProcessor = new DiffProcessor((message) => {
         const mapped = mapCodexProcessorMessageToSessionEnvelopes(message, { currentTurnId });
-        currentTurnId = mapped.currentTurnId;
-        for (const envelope of mapped.envelopes) {
-            session.sendSessionProtocolMessage(envelope);
-        }
+        publishMappedMessages(mapped);
     });
     const updateCodexGoalState = (message: Record<string, unknown>) => {
         const capabilities = codexGoalActionCapabilities(client.supportsGoalActions());
@@ -732,6 +758,8 @@ export async function runCodex(opts: {
             }
         }
         if (msg.type === 'task_complete' || msg.type === 'turn_aborted') {
+            // Flush buffered output while the completing turn still owns it.
+            reasoningProcessor.abort();
             if (thinking) {
                 logger.debug('thinking completed');
                 thinking = false;
@@ -794,15 +822,15 @@ export async function runCodex(opts: {
                 collabReceiverThreadIdsByCall: codexCollabReceiverThreadIdsByCall,
                 collabToolByCall: codexCollabToolByCall,
             });
-            currentTurnId = mapped.currentTurnId;
             codexStartedSubagents = mapped.startedSubagents;
             codexActiveSubagents = mapped.activeSubagents;
             codexProviderSubagentToSessionSubagent = mapped.providerSubagentToSessionSubagent;
             codexSubagentTitles = mapped.subagentTitles;
             codexCollabReceiverThreadIdsByCall = mapped.collabReceiverThreadIdsByCall;
             codexCollabToolByCall = mapped.collabToolByCall;
-            for (const envelope of mapped.envelopes) {
-                session.sendSessionProtocolMessage(envelope);
+            publishMappedMessages(mapped);
+            if (msg.type === 'task_complete' || msg.type === 'turn_aborted') {
+                turnFinalizer.completed();
             }
         }
     });
@@ -875,7 +903,6 @@ export async function runCodex(opts: {
             }));
         }
 
-        let pending: { message: string; mode: EnhancedMode; isolate: boolean; hash: string; attachments?: PendingAttachment[] } | null = null;
 
         while (!shouldExit) {
             logActiveHandles('loop-top');
@@ -939,6 +966,8 @@ export async function runCodex(opts: {
                 messageBuffer.addMessage(message.message, 'user');
             }
 
+            let turnAborted = false;
+            turnFinalizer.begin();
             try {
                 // Map permission mode to approval policy and sandbox.
                 // With app-server, these are per-turn — no restart needed on mode change.
@@ -1010,6 +1039,7 @@ export async function runCodex(opts: {
                     appendSystemPromptInjected = true;
                 }
 
+                turnAborted = result.aborted;
                 if (result.aborted) {
                     // Turn was aborted (user abort or permission cancel).
                     // UI handling already done by the event handler (turn_aborted).
@@ -1017,23 +1047,13 @@ export async function runCodex(opts: {
                 }
             } catch (error) {
                 // Only actual errors reach here (process crash, connection failure, etc.)
+                reasoningProcessor.abort();
+                currentTurnId = null;
                 logger.warn('Error in codex session:', error);
                 messageBuffer.addMessage('Process exited unexpectedly', 'status');
                 session.sendSessionEvent({ type: 'message', message: 'Process exited unexpectedly' });
             } finally {
-                // Reset permission handler, reasoning processor, and diff processor
-                permissionHandler.reset();
-                reasoningProcessor.abort();  // Use abort to properly finish any in-progress tool calls
-                diffProcessor.reset();
-                activeTurnPermissionMode = undefined;
-                thinking = false;
-                session.keepAlive(thinking, 'remote');
-                emitReadyIfIdle({
-                    pending,
-                    queueSize: () => messageQueue.size(),
-                    shouldExit,
-                    sendReady,
-                });
+                turnFinalizer.settled(turnAborted);
                 logActiveHandles('after-turn');
             }
         }
