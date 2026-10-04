@@ -698,7 +698,8 @@ export async function machineUpdateMetadata(
     machineId: string,
     metadata: MachineMetadata,
     expectedVersion: number,
-    maxRetries: number = 3
+    maxRetries: number = 3,
+    fieldsToUpdate: Array<keyof MachineMetadata> = ['displayName']
 ): Promise<{ version: number; metadata: string }> {
     let currentVersion = expectedVersion;
     let currentMetadata = { ...metadata };
@@ -733,12 +734,11 @@ export async function machineUpdateMetadata(
             currentVersion = result.version!;
             const latestMetadata = await machineEncryption.decryptRaw(result.metadata!) as MachineMetadata;
 
-            // Merge our changes with the latest metadata
-            // Preserve the displayName we're trying to set, but use latest values for other fields
-            currentMetadata = {
-                ...latestMetadata,
-                displayName: metadata.displayName // Keep our intended displayName change
-            };
+            // Retry only the intended fields, preserving unrelated concurrent edits.
+            currentMetadata = { ...latestMetadata };
+            for (const field of fieldsToUpdate) {
+                (currentMetadata as Record<string, unknown>)[field] = metadata[field];
+            }
 
             retryCount++;
 
@@ -1164,11 +1164,36 @@ export async function sessionKill(sessionId: string): Promise<SessionKillRespons
  * Archive a session by deactivating it on the server.
  * Use this when the CLI process is already dead and sessionKill can't reach it.
  */
+export async function markSessionArchived(sessionId: string): Promise<void> {
+    const encryption = sync.encryption.getSessionEncryption(sessionId);
+    const session = storage.getState().sessions[sessionId];
+    if (!encryption || !session?.metadata) throw new Error('Session metadata is unavailable');
+    let version = session.metadataVersion;
+    let metadata: Record<string, unknown> = session.metadata;
+    for (let attempt = 0; attempt < 3; attempt++) {
+        const result = await apiSocket.emitWithAck<{
+            result: 'success' | 'version-mismatch' | 'error'; version?: number; metadata?: string;
+        }>('update-metadata', {
+            sid: sessionId, expectedVersion: version,
+            metadata: await encryption.encryptRaw({ ...metadata, lifecycleState: 'archived',
+                lifecycleStateSince: Date.now(), archivedBy: 'user', archiveReason: 'User archived' }),
+        });
+        if (result.result === 'success') return;
+        if (result.result !== 'version-mismatch' || result.version === undefined || !result.metadata) break;
+        version = result.version;
+        const latest = await encryption.decryptRaw(result.metadata);
+        if (!latest) break;
+        metadata = latest;
+    }
+    throw new Error('Could not save session archive state');
+}
+
 export async function sessionArchive(sessionId: string): Promise<{ success: boolean; message?: string }> {
     if (storage.getState().sessions[sessionId]?.metadata?.bot) {
         return { success: false, message: 'Connect to the bot’s machine to archive it.' };
     }
     try {
+        await markSessionArchived(sessionId);
         const response = await apiSocket.request(`/v1/sessions/${sessionId}/archive`, {
             method: 'POST'
         });

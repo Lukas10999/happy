@@ -1,3 +1,4 @@
+import { SessionRestoreSettings } from './SessionRestoreSettings';
 import { NativeScrollEvent, NativeSyntheticEvent, View, ScrollView, Pressable, Platform } from 'react-native';
 import { openExternalUrl } from '@/utils/openExternalUrl';
 import { Image } from 'expo-image';
@@ -258,6 +259,8 @@ export const SettingsView = React.memo(function SettingsView({
                     />
                 </ItemGroup>
             )}
+
+            <SessionRestoreSettings />
 
             {/* Support Us */}
             <ItemGroup>

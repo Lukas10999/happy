@@ -1,3 +1,4 @@
+import { currentProcessNamespace } from '@/utils/processNamespace';
 import type { PersistedSession } from '@/persistence';
 
 // Adapted from chphch's PR #1715. Only ESRCH proves absence: permission errors
@@ -17,7 +18,8 @@ export function machineBootTimeMs(uptimeSeconds: number, nowMs: number): number 
 }
 
 /** A live saved PID is a possible conflict, not verified session ownership. */
-export function hasPersistedProcessConflict(session: PersistedSession | undefined, bootTimeMs: number): boolean {
+export function hasPersistedProcessConflict(session: PersistedSession | undefined, bootTimeMs: number, namespace: string | null | undefined = currentProcessNamespace()): boolean {
     if (!session || session.savedAt < bootTimeMs) return false;
+    if (session.processNamespace && namespace && session.processNamespace !== namespace) return false;
     return isPidAlive(session.metadata?.hostPid);
 }

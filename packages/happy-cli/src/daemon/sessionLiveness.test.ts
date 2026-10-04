@@ -34,4 +34,15 @@ describe('session liveness (PR #1715)', () => {
             probe.mockRestore();
         }
     });
+    it('does not mistake a reused PID in a new container for a surviving session', () => {
+        const probe = vi.spyOn(process, 'kill').mockReturnValue(true);
+        const persisted = { metadata: { hostPid: 123 }, savedAt: 200, processNamespace: 'old-container' } as PersistedSession;
+        try {
+            expect(hasPersistedProcessConflict(persisted, 100, 'new-container')).toBe(false);
+            expect(probe).not.toHaveBeenCalled();
+            expect(hasPersistedProcessConflict(persisted, 100, 'old-container')).toBe(true);
+            expect(hasPersistedProcessConflict(persisted, 100, null)).toBe(true);
+        } finally { probe.mockRestore(); }
+    });
+
 });

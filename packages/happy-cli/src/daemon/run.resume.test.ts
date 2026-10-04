@@ -34,7 +34,8 @@ vi.mock('@/resume/localHappyAgentAuth', () => ({ detectResumeSupport: () => ({})
 vi.mock('./happyTerminalBoot', () => ({ startHappyTerminalDaemon: vi.fn() }));
 vi.mock('@/persistence', () => ({
   readPersistedSessions: () => mocks.persisted,
-  persistSession: mocks.persistSession, markSessionStopped: vi.fn(), writeDaemonState: vi.fn(), readDaemonState: vi.fn(),
+  persistSession: mocks.persistSession, markSessionStopped: vi.fn(), importSessionRestoreSnapshot: vi.fn(),
+  setSessionRestoreWanted: vi.fn(), readSettings: async () => ({ autoRestoreSessions: true }), writeDaemonState: vi.fn(), readDaemonState: vi.fn(),
   acquireDaemonLock: async () => ({}), releaseDaemonLock: vi.fn(),
 }));
 vi.mock('./controlClient', () => ({

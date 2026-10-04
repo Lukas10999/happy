@@ -483,6 +483,7 @@ export interface DecryptedMessage {
 //
 
 export const MachineMetadataSchema = z.object({
+    autoRestoreSessions: z.boolean().optional(),
     host: z.string(),
     platform: z.string(),
     happyCliVersion: z.string(),

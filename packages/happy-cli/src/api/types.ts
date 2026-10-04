@@ -134,6 +134,7 @@ export type Session = {
  * Machine metadata - static information (rarely changes)
  */
 export const MachineMetadataSchema = z.object({
+  autoRestoreSessions: z.boolean().optional(),
   host: z.string(),
   platform: z.string(),
   happyCliVersion: z.string(),

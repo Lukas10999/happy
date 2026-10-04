@@ -1,3 +1,5 @@
+import { currentProcessNamespace } from '@/utils/processNamespace';
+import { startAutomaticSessionRestore } from './autoRestoreSessions';
 import fs from 'fs/promises';
 import os from 'os';
 import * as tmp from 'tmp';
@@ -14,7 +16,7 @@ import { startCaffeinate, stopCaffeinate } from '@/utils/caffeinate';
 import packageJson from '../../package.json';
 import { getEnvironmentInfo } from '@/ui/doctor';
 import { spawnHappyCLI } from '@/utils/spawnHappyCLI';
-import { writeDaemonState, DaemonLocallyPersistedState, readDaemonState, acquireDaemonLock, releaseDaemonLock, readPersistedSessions, persistSession, markSessionStopped } from '@/persistence';
+import { writeDaemonState, DaemonLocallyPersistedState, readDaemonState, acquireDaemonLock, releaseDaemonLock, readPersistedSessions, persistSession, markSessionStopped, setSessionRestoreWanted, readSettings, importSessionRestoreSnapshot } from '@/persistence';
 import type { PersistedSession } from '@/persistence';
 
 import { cleanupDaemonState, isDaemonRunningCurrentlyInstalledHappyVersion, stopDaemon } from './controlClient';
@@ -182,6 +184,7 @@ export async function startDaemon(): Promise<void> {
     // Retain session data after process exits so resume can still find it.
     // Pre-populate from disk so sessions survive daemon restarts.
     const sessionIdToFinishedSession = new Map<string, TrackedSession>();
+    importSessionRestoreSnapshot();
     const persisted = readPersistedSessions();
     for (const [id, s] of Object.entries(persisted)) {
       sessionIdToFinishedSession.set(id, {
@@ -239,6 +242,8 @@ export async function startDaemon(): Promise<void> {
           metadataVersion: encryption.metadataVersion,
           agentStateVersion: encryption.agentStateVersion,
           metadata: sessionMetadata,
+          restoreOnRestart: !stoppingPids.has(pid),
+          processNamespace: currentProcessNamespace(),
           savedAt: Date.now(),
           lastAliveAt: Date.now(),
         });
@@ -654,6 +659,8 @@ export async function startDaemon(): Promise<void> {
           ...reconnect.encryption,
           encryptionKey: encodeBase64(reconnect.encryption.encryptionKey),
           metadata: { ...reconnect.happySessionMetadataFromLocalWebhook, hostPid: happyProcess.pid },
+          restoreOnRestart: true,
+          processNamespace: currentProcessNamespace(),
           savedAt: Date.now(),
           lastAliveAt: Date.now(),
         });
@@ -707,15 +714,19 @@ export async function startDaemon(): Promise<void> {
 
     const fetchServerSessionMetadata = async (sessionId: string, encryptionKey: Uint8Array, encryptionVariant: 'legacy' | 'dataKey'): Promise<Metadata | null> => {
       try {
-        const response = await axios.get(`${configuration.serverUrl}/v1/sessions`, {
-          headers: { Authorization: `Bearer ${credentials.token}` },
-          timeout: 10_000,
-        });
-        const sessions = (response.data as { sessions: { id: string; metadata: string }[] }).sessions;
-        const matched = sessions.find(s => s.id === sessionId);
-        if (!matched) return null;
-        const decrypted = decrypt(encryptionKey, encryptionVariant, decodeBase64(matched.metadata));
-        return decrypted as Metadata | null;
+        let cursor: string | undefined;
+        do {
+          const response = await axios.get(`${configuration.serverUrl}/v2/sessions`, {
+            headers: { Authorization: `Bearer ${credentials.token}` },
+            params: { limit: 200, cursor }, timeout: 10_000,
+          });
+          const page = response.data as { sessions: { id: string; metadata: string }[]; nextCursor?: string; hasNext: boolean };
+          const matched = page.sessions.find(s => s.id === sessionId);
+          if (matched) return decrypt(encryptionKey, encryptionVariant, decodeBase64(matched.metadata)) as Metadata | null;
+          if (!page.hasNext || !page.nextCursor || page.nextCursor === cursor) return null;
+          cursor = page.nextCursor;
+        } while (cursor);
+        return null;
       } catch (error) {
         logger.debug(`[DAEMON RUN] Failed to fetch session metadata from server: ${error instanceof Error ? error.message : error}`);
         return null;
@@ -871,6 +882,7 @@ export async function startDaemon(): Promise<void> {
 
     // Stop a session by sessionId or PID fallback
     const stopSession = (sessionId: string): boolean => {
+      setSessionRestoreWanted(sessionId, false);
       logger.debug(`[DAEMON RUN] Attempting to stop session ${sessionId}`);
       const cancellingResume = resumesInFlight.has(sessionId);
       if (cancellingResume) cancelledResumes.add(sessionId);
@@ -879,6 +891,7 @@ export async function startDaemon(): Promise<void> {
       for (const [pid, session] of pidToTrackedSession.entries()) {
         if (session.happySessionId === sessionId ||
           (sessionId.startsWith('PID-') && pid === parseInt(sessionId.replace('PID-', '')))) {
+          if (session.happySessionId) setSessionRestoreWanted(session.happySessionId, false);
 
           if (!isPidAlive(pid)) {
             onChildExited(pid);
@@ -1013,7 +1026,7 @@ export async function startDaemon(): Promise<void> {
     // Get or create machine
     const machine = await api.getOrCreateMachine({
       machineId,
-      metadata: initialMachineMetadata,
+      metadata: { ...initialMachineMetadata, autoRestoreSessions: (await readSettings()).autoRestoreSessions !== false },
       daemonState: initialDaemonState
     });
     logger.debug(`[DAEMON RUN] Machine registered: ${machine.id}`);
@@ -1032,6 +1045,25 @@ export async function startDaemon(): Promise<void> {
 
     // Connect to server
     apiMachine.connect();
+    const stopAutomaticRestore = startAutomaticSessionRestore({
+      machineId,
+      isReady: () => apiMachine.isReady(),
+      isEnabled: () => apiMachine.isSessionRestoreEnabled(),
+      prepare: () => apiMachine.refreshSessionRestorePreference(),
+      canRestore: async (id, saved) => {
+        if (!saved) return false;
+        const metadata = await fetchServerSessionMetadata(id, decodeBase64(saved.encryptionKey), saved.encryptionVariant);
+        if (!metadata) return false; // Deleted, inaccessible, or offline: never guess.
+        if (metadata.lifecycleState === 'archived') {
+          setSessionRestoreWanted(id, false);
+          return false;
+        }
+        return metadata.machineId === machineId;
+      },
+      readSessions: readPersistedSessions,
+      resume: resumeSession,
+      onResult: (id, result) => logger.debug(`[DAEMON RUN] Automatic restore ${id}: ${result.type}`),
+    });
 
     // Every 60 seconds:
     // 1. Prune stale sessions
@@ -1134,6 +1166,8 @@ export async function startDaemon(): Promise<void> {
     // Setup signal handlers
     const cleanupAndShutdown = async (source: 'happy-app' | 'happy-cli' | 'os-signal' | 'exception', errorMessage?: string) => {
       logger.debug(`[DAEMON RUN] Starting proper cleanup (source: ${source}, errorMessage: ${errorMessage})...`);
+
+      stopAutomaticRestore();
 
       // Clear health check interval
       if (restartOnStaleVersionAndHeartbeat) {

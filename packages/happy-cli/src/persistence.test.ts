@@ -6,6 +6,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
     acquireDaemonLock,
     markSessionStopped,
+    importSessionRestoreSnapshot,
+    setSessionRestoreWanted,
+    readSettings,
     persistSession,
     readPersistedSessions,
     releaseDaemonLock,
@@ -20,6 +23,7 @@ const mockConfiguration = vi.hoisted(() => ({
     isDaemonProcess: false,
     logsDir: '/tmp',
     sessionsFile: '',
+    settingsFile: '',
 }));
 
 vi.mock('@/configuration', () => ({
@@ -182,12 +186,55 @@ describe('persisted session retention', () => {
     beforeEach(() => {
         dir = mkdtempSync(join(tmpdir(), 'happy-sessions-'));
         mockConfiguration.sessionsFile = join(dir, 'sessions.json');
+        mockConfiguration.settingsFile = join(dir, 'settings.json');
         mockOs.uptimeSeconds = 365 * 24 * 60 * 60;
     });
 
     afterEach(() => {
         vi.restoreAllMocks();
         rmSync(dir, { recursive: true, force: true });
+    });
+
+    it('imports only snapshot-open history, retaining keys and explicit close decisions', () => {
+        const old = Date.now() - 90 * DAY_MS;
+        writeSessions({ open: sessionRecord({ savedAt: old }), history: sessionRecord({ savedAt: old }),
+            closed: sessionRecord({ restoreOnRestart: false }), archived: sessionRecord({
+                metadata: { lifecycleState: 'archived' } as any }) });
+        writeFileSync(mockConfiguration.sessionsFile + '.restore-snapshot', JSON.stringify({
+            ids: ['open', 'closed', 'archived'], capturedAt: Date.now(), processNamespace: 'pid:[old]' }));
+        importSessionRestoreSnapshot();
+        const result = readPersistedSessions();
+        expect(result.open).toMatchObject({ encryptionKey: 'a2V5', restoreOnRestart: true, processNamespace: 'pid:[old]' });
+        expect(result.history).toBeUndefined();
+        expect(result.closed.restoreOnRestart).toBe(false);
+        expect(result.archived.restoreOnRestart).toBe(false);
+        expect(existsSync(mockConfiguration.sessionsFile + '.restore-snapshot')).toBe(false);
+        importSessionRestoreSnapshot(); // Consumed once.
+    });
+
+    it('defaults automatic restoration on for existing settings without the key', async () => {
+        writeFileSync(mockConfiguration.settingsFile, JSON.stringify({ schemaVersion: 2, onboardingCompleted: true }));
+        expect((await readSettings()).autoRestoreSessions).toBe(true);
+    });
+
+    it('persists explicit closes without deleting chat keys or history', () => {
+        const record = sessionRecord({ restoreOnRestart: true });
+        persistSession('open', record);
+        setSessionRestoreWanted('open', false);
+        expect(readPersistedSessions().open).toEqual({ ...record, restoreOnRestart: false });
+        markSessionStopped('open');
+        expect(readPersistedSessions().open.restoreOnRestart).toBe(false);
+    });
+
+    it('retains desired open state after an unexpected process exit', () => {
+        persistSession('open', sessionRecord({ restoreOnRestart: true }));
+        markSessionStopped('open');
+        expect(readPersistedSessions().open.restoreOnRestart).toBe(true);
+    });
+
+    it('keeps desired-open sessions after a long shutdown', () => {
+        writeSessions({ open: sessionRecord({ restoreOnRestart: true, savedAt: Date.now() - 90 * DAY_MS }) });
+        expect(readPersistedSessions().open?.restoreOnRestart).toBe(true);
     });
 
     it('keeps a session that was in use yesterday but started long ago', () => {

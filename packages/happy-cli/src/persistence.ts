@@ -1,3 +1,4 @@
+import { currentProcessNamespace } from '@/utils/processNamespace';
 /**
  * Minimal persistence functions for happy CLI
  * 
@@ -42,6 +43,7 @@ interface Settings {
   machineId?: string
   machineIdConfirmedByServer?: boolean
   daemonAutoStartWhenRunningHappy?: boolean
+  autoRestoreSessions?: boolean
   chromeMode?: boolean
   sandboxConfig?: SandboxConfig
   serverUrl?: string
@@ -51,6 +53,7 @@ interface Settings {
 const defaultSettings: Settings = {
   schemaVersion: SUPPORTED_SCHEMA_VERSION,
   onboardingCompleted: false,
+  autoRestoreSessions: true,
   sandboxConfig: undefined,
 }
 
@@ -417,6 +420,9 @@ export async function releaseDaemonLock(lockHandle: FileHandle): Promise<void> {
 // ─── Session persistence (survives daemon restarts) ───
 
 export type PersistedSession = {
+  /** Desired open state. Explicit stops clear it; process/host crashes do not. */
+  restoreOnRestart?: boolean;
+  processNamespace?: string;
   encryptionKey: string;
   encryptionVariant: 'legacy' | 'dataKey';
   seq: number;
@@ -457,6 +463,8 @@ function lastAliveAt(session: PersistedSession): number {
  * true, since nothing survives a reboot.
  */
 function isSessionProcessRunning(session: PersistedSession): boolean {
+  const namespace = currentProcessNamespace();
+  if (session.processNamespace && namespace && session.processNamespace !== namespace) return false;
   const pid = session.metadata?.hostPid;
   if (!Number.isSafeInteger(pid) || pid! <= 0) return false;
   if (session.savedAt < Date.now() - os.uptime() * 1000) return false;
@@ -468,6 +476,28 @@ function isSessionProcessRunning(session: PersistedSession): boolean {
     // cannot lose its only warning about a possibly live detached owner.
     return (error as NodeJS.ErrnoException).code !== 'ESRCH';
   }
+}
+
+/** Import an upgrade snapshot under the daemon lock; the old daemon never shares this file. */
+export function importSessionRestoreSnapshot(): void {
+  const snapshotFile = configuration.sessionsFile + '.restore-snapshot';
+  if (!existsSync(snapshotFile)) return;
+  const snapshot = JSON.parse(readFileSync(snapshotFile, 'utf-8')) as { ids: string[]; processNamespace?: string; capturedAt: number };
+  if (!Array.isArray(snapshot.ids) || !snapshot.ids.every(id => typeof id === 'string')
+      || !Number.isFinite(snapshot.capturedAt)) throw new Error('Invalid session restore snapshot');
+  if (!existsSync(configuration.sessionsFile)) { unlinkSync(snapshotFile); return; }
+  const data = JSON.parse(readFileSync(configuration.sessionsFile, 'utf-8')) as SessionsFile;
+  const open = new Set(snapshot.ids);
+  for (const [id, session] of Object.entries(data.sessions)) {
+    if (session.restoreOnRestart !== undefined) continue;
+    session.restoreOnRestart = open.has(id) && session.metadata.lifecycleState !== 'archived';
+    if (session.restoreOnRestart) {
+      session.processNamespace = snapshot.processNamespace;
+      session.lastAliveAt = Math.max(session.lastAliveAt ?? session.savedAt, snapshot.capturedAt);
+    }
+  }
+  writeSessionsFile(data.sessions);
+  unlinkSync(snapshotFile);
 }
 
 export function readPersistedSessions(): Record<string, PersistedSession> {
@@ -483,7 +513,7 @@ export function readPersistedSessions(): Record<string, PersistedSession> {
       // copy of the encryption key, so dropping it makes a live session
       // permanently unreachable — the daemon can no longer re-adopt it after a
       // restart, and resume cannot find it either.
-      if (isSessionProcessRunning(session)) {
+      if (session.restoreOnRestart === true || isSessionProcessRunning(session)) {
         sessions[id] = session;
         continue;
       }
@@ -513,6 +543,12 @@ export function markSessionStopped(sessionId: string): void {
   } catch (error) {
     logger.debug(`[PERSISTENCE] Failed to mark session ${sessionId} stopped:`, error);
   }
+}
+
+/** Preserve history/key material while suppressing automatic reopening after a user stop. */
+export function setSessionRestoreWanted(sessionId: string, wanted: boolean): void {
+  const session = readPersistedSessions()[sessionId];
+  if (session) persistSession(sessionId, { ...session, restoreOnRestart: wanted });
 }
 
 function writeSessionsFile(sessions: Record<string, PersistedSession>): void {

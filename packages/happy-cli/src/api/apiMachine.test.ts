@@ -1,3 +1,6 @@
+import axios from 'axios';
+import { updateSettings } from '@/persistence';
+import { encodeBase64, encrypt } from './encryption';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiMachineClient } from './apiMachine';
 import type { Machine } from './types';
@@ -9,6 +12,9 @@ const {
     mockIo: vi.fn(),
     mockShouldReconnect: vi.fn(() => true)
 }));
+
+vi.mock('axios', () => ({ default: { get: vi.fn() } }));
+vi.mock('@/persistence', () => ({ updateSettings: vi.fn(async () => {}) }));
 
 vi.mock('socket.io-client', () => ({
     io: mockIo
@@ -125,6 +131,25 @@ describe('ApiMachineClient socket reconnection', () => {
     afterEach(() => {
         vi.useRealTimers();
         vi.restoreAllMocks();
+    });
+
+    it('refreshes an offline default before restoring and caches the authoritative disabled setting', async () => {
+        const machine = makeMachine();
+        const client = new ApiMachineClient('fake-token', machine);
+        expect(client.isSessionRestoreEnabled()).toBe(true);
+        vi.mocked(axios.get).mockResolvedValueOnce({ data: { machine: {
+            metadata: encodeBase64(encrypt(machine.encryptionKey, machine.encryptionVariant,
+                { ...machine.metadata, autoRestoreSessions: false })), metadataVersion: 2,
+        } } });
+        expect(await client.refreshSessionRestorePreference()).toBe(false);
+        const update = vi.mocked(updateSettings).mock.calls.at(-1)![0];
+        expect(update({} as any)).toMatchObject({ autoRestoreSessions: false });
+    });
+
+    it('rejects recovery preparation when authoritative settings cannot be fetched', async () => {
+        const client = new ApiMachineClient('fake-token', makeMachine());
+        vi.mocked(axios.get).mockRejectedValueOnce(new Error('offline'));
+        await expect(client.refreshSessionRestorePreference()).rejects.toThrow('offline');
     });
 
     it('retries after initial socket connection error', async () => {

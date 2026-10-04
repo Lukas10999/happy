@@ -1,3 +1,5 @@
+import axios from 'axios';
+import { updateSettings } from '@/persistence';
 /**
  * WebSocket client for machine/daemon communication with Happy server
  * Similar to ApiSessionClient but for machine-scoped connections
@@ -171,6 +173,7 @@ export class ApiMachineClient {
         // null = unrestricted: the daemon serves the whole machine, and its
         // process.cwd() is an accident of where it was started, not a workspace.
         registerCommonHandlers(this.rpcHandlerManager, null);
+        this.cacheSessionRestorePreference();
     }
 
     setRPCHandlers({
@@ -432,12 +435,14 @@ export class ApiMachineClient {
             if (answer.result === 'success') {
                 this.machine.metadata = decrypt(this.machine.encryptionKey, this.machine.encryptionVariant, decodeBase64(answer.metadata));
                 this.machine.metadataVersion = answer.version;
+                await this.cacheSessionRestorePreference();
                 logger.debug('[API MACHINE] Metadata updated successfully');
             } else if (answer.result === 'version-mismatch') {
                 if (answer.version > this.machine.metadataVersion) {
                     this.machine.metadataVersion = answer.version;
                     this.machine.metadata = decrypt(this.machine.encryptionKey, this.machine.encryptionVariant, decodeBase64(answer.metadata));
                 }
+                await this.cacheSessionRestorePreference();
                 throw new Error('Metadata version mismatch'); // Triggers retry
             }
         });
@@ -468,6 +473,35 @@ export class ApiMachineClient {
                 }
                 throw new Error('Daemon state version mismatch'); // Triggers retry
             }
+        });
+    }
+
+    /** Read authoritative settings before recovery, including after an offline start. */
+    async refreshSessionRestorePreference(): Promise<boolean> {
+        const response = await axios.get(`${configuration.serverUrl}/v1/machines/${this.machine.id}`, {
+            headers: { Authorization: `Bearer ${this.token}` }, timeout: 10_000,
+        });
+        const remote = response.data.machine;
+        if (!remote?.metadata || typeof remote.metadataVersion !== 'number') throw new Error('Missing machine metadata');
+        const metadata = decrypt(this.machine.encryptionKey, this.machine.encryptionVariant, decodeBase64(remote.metadata)) as MachineMetadata | null;
+        if (!metadata) throw new Error('Could not decrypt machine metadata');
+        if (remote.metadataVersion >= this.machine.metadataVersion) {
+            this.machine.metadata = metadata;
+            this.machine.metadataVersion = remote.metadataVersion;
+        }
+        await this.cacheSessionRestorePreference();
+        return this.isSessionRestoreEnabled();
+    }
+
+    isSessionRestoreEnabled(): boolean {
+        return this.machine.metadata?.autoRestoreSessions !== false;
+    }
+
+    private async cacheSessionRestorePreference(): Promise<void> {
+        const value = this.machine.metadata?.autoRestoreSessions;
+        if (typeof value !== 'boolean') return;
+        await updateSettings(settings => ({ ...settings, autoRestoreSessions: value })).catch(error => {
+            logger.debug('[API MACHINE] Could not cache session restore preference:', error);
         });
     }
 
@@ -561,6 +595,7 @@ export class ApiMachineClient {
                     logger.debug('[API MACHINE] Received external metadata update');
                     this.machine.metadata = decrypt(this.machine.encryptionKey, this.machine.encryptionVariant, decodeBase64(update.metadata.value));
                     this.machine.metadataVersion = update.metadata.version;
+                    this.cacheSessionRestorePreference();
                 }
 
                 if (update.daemonState) {
