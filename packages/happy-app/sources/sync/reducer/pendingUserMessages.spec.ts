@@ -461,3 +461,44 @@ describe('participants and turns', () => {
         expect(updated.kind === 'tool-call' && updated.turn).toBe('turn-a');
     });
 });
+
+
+describe('confirmed user message chronology', () => {
+    it.each([false, true])('uses server chronology when the browser clock is ahead (same batch: %s)', (sameBatch) => {
+        const state = createReducer();
+        const local = optimistic('local-clock', 'question', 9000);
+        const confirmed = echo('server-clock', 'local-clock', 'question', 1000);
+        const answer = agentText('answer-clock', 'reply', 2000);
+        const visible = new Map<string, Message>();
+        const apply = (batch: NormalizedMessage[]) => {
+            for (const row of reducer(state, batch).messages) visible.set(row.id, row);
+        };
+        if (sameBatch) apply([local, confirmed, answer]);
+        else { apply([local]); apply([answer]); apply([confirmed]); }
+        const chronological = [...visible.values()].sort((a, b) => messageSortKey(a) - messageSortKey(b));
+        expect(chronological.map(row => row.kind)).toEqual(['user-text', 'agent-text']);
+        expect(chronological[0].createdAt).toBe(9000);
+        expect(messageSortKey(chronological[0])).toBe(1000);
+        expect(userMessages([...visible.values()])).toHaveLength(1);
+    });
+
+    it('does not settle a queued prompt on server delivery before agent acceptance', () => {
+        const state = createReducer();
+        reducer(state, [optimistic('local-clock', 'queued', 9000)], null, HOLD);
+        reducer(state, [echo('server-clock', 'local-clock', 'queued', 1000)], null, HOLD);
+        const result = reducer(state, [receipt('accepted-clock', 'server-clock', 12000)], null, HOLD);
+        expect(messageSortKey(result.messages[0])).toBe(12000);
+    });
+});
+
+
+it('lets a later rejection override server delivery position on an unheld optimistic row', () => {
+    const state = createReducer();
+    reducer(state, [optimistic('late-local', 'question', 9000)]);
+    reducer(state, [echo('late-server', 'late-local', 'question', 1000)]);
+    const result = reducer(state, [{
+        ...receipt('late-rejected', 'late-server', 12000),
+        content: { type: 'user-message-rejected', ref: 'late-server', reason: 'unavailable' },
+    }]);
+    expect(result.messages[0]).toMatchObject({ kind: 'user-text', sortAt: 12000, sendError: 'unavailable' });
+});

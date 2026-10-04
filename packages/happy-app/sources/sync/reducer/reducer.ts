@@ -133,6 +133,8 @@ type ReducerMessage = {
     pending?: boolean;
     sendError?: string;
     sortAt?: number;
+    /** Server delivery position for an optimistic row; receipts still take precedence. */
+    serverCreatedAt?: number;
     turn?: string;
     author?: SessionAuthor;
 }
@@ -331,16 +333,28 @@ function settleUserMessage(state: ReducerState, internalId: string, receipt: { c
  * knows by `serverId`, and settles it right away when its acceptance receipt
  * got here first. Returns true when the message settled and must be re-emitted.
  */
-function joinUserMessageServerId(state: ReducerState, serverId: string, internalId: string): boolean {
+function joinUserMessageServerId(state: ReducerState, serverId: string, internalId: string, serverCreatedAt?: number): boolean {
+    const message = state.messages.get(internalId);
+    let positioned = false;
+    // The optimistic timestamp came from the browser clock. Once delivery is
+    // confirmed, use the server position, as a reload would. Acceptance-based
+    // queues keep their pending/receipt position instead.
+    if (serverCreatedAt !== undefined && Number.isFinite(serverCreatedAt)
+        && message?.role === 'user' && message.localId !== null
+        && message.realID === message.localId && serverId !== message.localId
+        && message.serverCreatedAt === undefined) {
+        message.serverCreatedAt = serverCreatedAt;
+        positioned = true;
+    }
     if (!state.messageIds.has(serverId)) {
         state.messageIds.set(serverId, internalId);
     }
     const receipt = state.pendingReceipts.get(serverId);
     if (receipt === undefined) {
-        return false;
+        return positioned;
     }
     state.pendingReceipts.delete(serverId);
-    return settleUserMessage(state, internalId, receipt);
+    return settleUserMessage(state, internalId, receipt) || positioned;
 }
 
 /**
@@ -419,7 +433,7 @@ export function reducer(state: ReducerState, messages: NormalizedMessage[], agen
             // this too, through registerUserMessageServerIds; whichever runs first
             // wins and the other is a no-op.)
             const internalId = state.localIds.get(msg.localId)!;
-            if (joinUserMessageServerId(state, msg.id, internalId)) {
+            if (joinUserMessageServerId(state, msg.id, internalId, msg.createdAt)) {
                 changed.add(internalId);
                 settledIds.add(internalId);
             }
@@ -829,7 +843,7 @@ export function reducer(state: ReducerState, messages: NormalizedMessage[], agen
                 // past Phase 0.5's guard — localIds is not written until here —
                 // so this dedupe is its only stop. Record the join it carries.
                 const internalId = state.localIds.get(msg.localId)!;
-                if (joinUserMessageServerId(state, msg.id, internalId)) {
+                if (joinUserMessageServerId(state, msg.id, internalId, msg.createdAt)) {
                     changed.add(internalId);
                     settledIds.add(internalId);
                 }
@@ -1419,7 +1433,8 @@ function convertReducerMessageToMessage(reducerMsg: ReducerMessage, state: Reduc
             ...(reducerMsg.codexItemId && { codexItemId: reducerMsg.codexItemId }),
             ...(reducerMsg.pending && { pending: true }),
             ...(reducerMsg.sendError !== undefined && { sendError: reducerMsg.sendError }),
-            ...(reducerMsg.sortAt !== undefined && { sortAt: reducerMsg.sortAt }),
+            ...((reducerMsg.sortAt ?? reducerMsg.serverCreatedAt) !== undefined
+                && { sortAt: reducerMsg.sortAt ?? reducerMsg.serverCreatedAt }),
             ...(reducerMsg.author && { author: reducerMsg.author }),
             meta: reducerMsg.meta
         };
