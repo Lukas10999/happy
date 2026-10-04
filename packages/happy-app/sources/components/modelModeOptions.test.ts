@@ -151,6 +151,8 @@ describe('modelModeOptions', () => {
         expect(models.map((model) => model.key)).toEqual([
             'claude-fable-5-1',
             'claude-fable-5',
+            'claude-opus-5-5',
+            'claude-opus-5-5[1m]',
             'claude-opus-5',
             'claude-opus-5[1m]',
             'claude-sonnet-5',
@@ -158,6 +160,8 @@ describe('modelModeOptions', () => {
         expect(models.map((model) => model.name)).toEqual([
             'Fable 5.1',
             'Fable 5',
+            'Opus 5.5',
+            'Opus 5.5 [1M]',
             'Opus 5',
             'Opus 5 [1M]',
             'Sonnet 5',
