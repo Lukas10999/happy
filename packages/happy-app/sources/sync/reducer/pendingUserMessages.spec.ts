@@ -498,6 +498,7 @@ it('lets a later rejection override server delivery position on an unheld optimi
     reducer(state, [echo('late-server', 'late-local', 'question', 1000)]);
     const result = reducer(state, [{
         ...receipt('late-rejected', 'late-server', 12000),
+        role: 'event',
         content: { type: 'user-message-rejected', ref: 'late-server', reason: 'unavailable' },
     }]);
     expect(result.messages[0]).toMatchObject({ kind: 'user-text', sortAt: 12000, sendError: 'unavailable' });
