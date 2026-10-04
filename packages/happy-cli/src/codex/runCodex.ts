@@ -353,7 +353,7 @@ export async function runCodex(opts: {
     let thinking = false;
     let currentTurnId: string | null = null;
     const turnFinalizer = createCodexTurnFinalizer(() => currentTurnId, () => {
-        permissionHandler.reset();
+        permissionHandler.resetForTurn();
         diffProcessor.reset();
         activeTurnPermissionMode = undefined;
         thinking = false;
@@ -668,6 +668,8 @@ export async function runCodex(opts: {
     });
 
     // Approval handler: routes server → client approval requests to our permission handler
+    client.setUserInputHandler((params, signal) => permissionHandler.handleUserInput(params, signal));
+
     client.setApprovalHandler(async (params) => {
         const toolName = params.type === 'exec'
             ? 'CodexBash'

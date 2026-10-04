@@ -128,6 +128,61 @@ describe('CodexAppServerClient sandbox integration', () => {
         process.env.RUST_LOG = originalRustLog;
     });
 
+    it('round-trips question answers without invoking approval policy', async () => {
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const replies: any[] = [];
+        const proc = createMockProcess({onRequest: msg => { if (msg.result) replies.push(msg); }});
+        mockSpawn.mockReturnValue(proc);
+        const client = new CodexAppServerClient();
+        const approval = vi.fn();
+        client.setApprovalHandler(approval);
+        client.setUserInputHandler(async params => {
+            expect(params.questions[0].id).toBe('q');
+            return {answers: {q: {answers: ['Yes, please']}}};
+        });
+        await client.connect();
+        pushJsonLine(proc.stdout, {id:'question-1', method:'item/tool/requestUserInput', params:{
+            threadId:'t', turnId:'u', itemId:'i', isBlocking:false,
+            questions:[{id:'q',header:'Choice',question:'Continue?'}],
+        }});
+        await waitFor(() => replies.length === 1);
+        expect(replies[0]).toEqual({jsonrpc:'2.0',id:'question-1',result:{answers:{q:{answers:['Yes, please']}}}});
+        expect(approval).not.toHaveBeenCalled();
+        await client.disconnect();
+    });
+
+    it.each(['resolved', 'exit', 'disconnect'])('cancels questions on %s without a stale reply', async reason => {
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const replies: any[] = [];
+        const proc = createMockProcess({onRequest: msg => { if (msg.result) replies.push(msg); }});
+        mockSpawn.mockReturnValue(proc);
+        const client = new CodexAppServerClient();
+        let signal: AbortSignal | undefined;
+        let answer!: (value: any) => void;
+        client.setUserInputHandler((_params, requestSignal) => {
+            signal = requestSignal;
+            return new Promise(resolve => { answer = resolve; });
+        });
+        await client.connect();
+        pushJsonLine(proc.stdout, {id:90,method:'item/tool/requestUserInput',params:{
+            threadId:'t',turnId:'u',itemId:'i',isBlocking:false,
+            questions:[{id:'q',header:'Q',question:'Continue?'}],
+        }});
+        await waitFor(() => !!signal);
+        if (reason === 'resolved') {
+            pushJsonLine(proc.stdout,{method:'serverRequest/resolved',params:{threadId:'other',requestId:90}});
+            await new Promise(resolve => setTimeout(resolve, 10));
+            expect(signal!.aborted).toBe(false);
+            pushJsonLine(proc.stdout,{method:'serverRequest/resolved',params:{threadId:'t',requestId:90}});
+        } else if (reason === 'exit') proc.emit('exit', 1, null);
+        else await client.disconnect();
+        await waitFor(() => signal!.aborted);
+        answer({answers:{q:{answers:['late']}}});
+        await new Promise(resolve => setTimeout(resolve, 10));
+        expect(replies).toEqual([]);
+        await client.disconnect();
+    });
+
     it('reports goal action support for Codex versions with goal action requests', async () => {
         const { CodexAppServerClient } = await import('./codexAppServerClient');
 

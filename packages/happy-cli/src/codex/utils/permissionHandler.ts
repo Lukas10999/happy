@@ -1,3 +1,4 @@
+import type { UserInputParams, UserInputResponse } from '../userInput';
 /**
  * Codex Permission Handler
  *
@@ -45,6 +46,49 @@ export class CodexPermissionHandler extends BasePermissionHandler {
         return '[Codex]';
     }
 
+    resetForTurn(): void {
+        this.reset('Turn completed', ['AskUserQuestion']);
+    }
+
+    async handleUserInput(params: UserInputParams, signal: AbortSignal): Promise<UserInputResponse> {
+        if (signal.aborted) return { answers: {} };
+        const cancel = () => {
+            const pending = this.pendingRequests.get(params.callId);
+            if (!pending) return;
+            this.pendingRequests.delete(params.callId);
+            pending.resolve({ decision: 'abort' });
+            this.session.updateAgentState(state => {
+                const request = state.requests?.[params.callId];
+                if (!request) return state;
+                const { [params.callId]: _, ...requests } = state.requests || {};
+                return { ...state, requests, completedRequests: {
+                    ...state.completedRequests,
+                    [params.callId]: { ...request, status: 'canceled', completedAt: Date.now() },
+                }};
+            });
+        };
+        const pending = this.handleToolCall(params.callId, 'AskUserQuestion', {
+            provider: 'codex',
+            questions: params.questions.map(question => ({ ...question, options: question.options ?? [] })),
+        });
+        signal.addEventListener('abort', cancel, {once: true});
+        try {
+            const result = await pending;
+            if (result.decision !== 'approved') return {answers: {}};
+            const answers = result.updatedInput?.answers;
+            if (!answers || typeof answers !== 'object' || Array.isArray(answers)) return {answers: {}};
+            return {answers: Object.fromEntries(params.questions.flatMap(question => {
+                const value = Object.hasOwn(answers, question.id) ? (answers as Record<string, unknown>)[question.id] : undefined;
+                return typeof value === 'string' && value.trim().length > 0
+                    ? [[question.id, {answers: [value]}]] : [];
+            }))};
+        } catch {
+            return {answers: {}};
+        } finally {
+            signal.removeEventListener('abort', cancel);
+        }
+    }
+
     private shouldAutoApprove(toolName: string, toolCallId: string): boolean {
         if (CodexPermissionHandler.ALWAYS_AUTO_APPROVE_NAMES.has(toolName)) {
             return true;
@@ -77,7 +121,7 @@ export class CodexPermissionHandler extends BasePermissionHandler {
         toolName: string,
         input: unknown
     ): Promise<PermissionResult> {
-        if (this.shouldAutoApprove(toolName, toolCallId)) {
+        if (toolName !== 'AskUserQuestion' && this.shouldAutoApprove(toolName, toolCallId)) {
             logger.debug(`${this.getLogPrefix()} Auto-approving tool ${toolName} (${toolCallId})`);
 
             this.session.updateAgentState((currentState) => ({

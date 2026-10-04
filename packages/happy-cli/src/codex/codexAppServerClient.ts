@@ -1,3 +1,4 @@
+import { userInputParamsSchema, type UserInputHandler } from './userInput';
 /**
  * Codex App Server Client — drives Codex via the v2 JSON-RPC protocol
  * (`codex app-server`), replacing the legacy MCP-based CodexMcpClient.
@@ -256,6 +257,18 @@ export class CodexAppServerClient {
     // Handlers set by the consumer (runCodex.ts)
     private eventHandler: ((msg: EventMsg) => void) | null = null;
     private approvalHandler: ApprovalHandler | null = null;
+    private userInputHandler: UserInputHandler | null = null;
+    private userInputRequests = new Map<number | string, {controller: AbortController; threadId: string}>();
+
+    setUserInputHandler(handler: UserInputHandler): void {
+        this.userInputHandler = handler;
+    }
+
+    private cancelUserInputs(): void {
+        for (const request of this.userInputRequests.values()) request.controller.abort();
+        this.userInputRequests.clear();
+    }
+
 
     constructor(sandboxConfig?: SandboxConfig) {
         this.sandboxConfig = sandboxConfig;
@@ -663,6 +676,7 @@ export class CodexAppServerClient {
                 return;
             }
             this.connected = false;
+            this.cancelUserInputs();
             // Reject all pending requests
             for (const [id, req] of this.pending) {
                 if (req.epoch !== epoch) continue;
@@ -707,6 +721,7 @@ export class CodexAppServerClient {
     private async disconnectInternal(opts?: { preserveThreadState?: boolean }): Promise<void> {
         if (!this.connected && !this.process) return;
 
+        this.cancelUserInputs();
         const proc = this.process;
         const pid = proc?.pid;
         const epoch = this.processEpoch;
@@ -1260,7 +1275,7 @@ export class CodexAppServerClient {
         logger.debug(`[CodexAppServer] → ${method} (notification)`);
     }
 
-    private respond(id: number, result: unknown): void {
+    private respond(id: number | string, result: unknown): void {
         if (!this.process?.stdin?.writable) return;
         const msg: JsonRpcResponse = { jsonrpc: '2.0', id, result };
         this.process.stdin.write(JSON.stringify(msg) + '\n');
@@ -1392,7 +1407,30 @@ export class CodexAppServerClient {
         };
     }
 
-    private async handleServerRequest(id: number, method: string, params: any): Promise<void> {
+    private async handleServerRequest(id: number | string, method: string, params: any): Promise<void> {
+        if (method === 'item/tool/requestUserInput') {
+            const parsed = userInputParamsSchema.safeParse(params);
+            if (!parsed.success || !this.userInputHandler) {
+                this.respond(id, {answers: {}});
+                return;
+            }
+            const epoch = this.processEpoch;
+            const controller = new AbortController();
+            this.userInputRequests.get(id)?.controller.abort();
+            this.userInputRequests.set(id, {controller, threadId: parsed.data.threadId});
+            let result = {answers: {}};
+            try {
+                result = await this.userInputHandler({ ...parsed.data,
+                    callId: `${formatScopedItemKey(parsed.data.threadId, parsed.data.itemId)}:question:${id}`,
+                }, controller.signal);
+            } catch {
+                logger.debug('[CodexAppServer] Question handler failed');
+            } finally {
+                if (this.userInputRequests.get(id)?.controller === controller) this.userInputRequests.delete(id);
+            }
+            if (!controller.signal.aborted && epoch === this.processEpoch && this.connected) this.respond(id, result);
+            return;
+        }
         if (method === 'mcpServer/elicitation/request') {
             const threadId = stringOrNull(params?.threadId) ?? this._threadId;
             const turnId = stringOrNull(params?.turnId);
@@ -1509,6 +1547,14 @@ export class CodexAppServerClient {
     }
 
     private handleNotification(method: string, params: any): void {
+        if (method === 'serverRequest/resolved') {
+            const request = this.userInputRequests.get(params?.requestId);
+            if (request && request.threadId === params?.threadId) {
+                request.controller.abort();
+                this.userInputRequests.delete(params.requestId);
+            }
+            return;
+        }
         // codex/event notifications: either `codex/event` or `codex/event/<type>`
         if (method === 'codex/event' || method.startsWith('codex/event/')) {
             this.notificationProtocol = 'legacy';

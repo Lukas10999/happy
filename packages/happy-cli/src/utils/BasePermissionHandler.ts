@@ -17,6 +17,7 @@ import { AgentState } from "@/api/types";
 export interface PermissionResponse {
     id: string;
     approved: boolean;
+    updatedInput?: Record<string, unknown>;
     decision?: 'approved' | 'approved_for_session' | 'denied' | 'abort';
 }
 
@@ -34,6 +35,7 @@ export interface PendingRequest {
  * Result of a permission request.
  */
 export interface PermissionResult {
+    updatedInput?: Record<string, unknown>;
     decision: 'approved' | 'approved_for_session' | 'denied' | 'abort';
 }
 
@@ -90,6 +92,9 @@ export abstract class BasePermissionHandler {
                     ? { decision: response.decision === 'approved_for_session' ? 'approved_for_session' : 'approved' }
                     : { decision: response.decision === 'denied' ? 'denied' : 'abort' };
 
+                if (response.approved && response.updatedInput && typeof response.updatedInput === 'object' && !Array.isArray(response.updatedInput)) {
+                    result.updatedInput = response.updatedInput;
+                }
                 pending.resolve(result);
 
                 // Move request to completed in agent state
@@ -196,7 +201,7 @@ export abstract class BasePermissionHandler {
      * Reset state for new sessions.
      * This method is idempotent - safe to call multiple times.
      */
-    reset(reason: string = 'Session reset'): void {
+    reset(reason: string = 'Session reset', preserveTools: readonly string[] = []): void {
         // Guard against re-entrant/concurrent resets
         if (this.isResetting) {
             logger.debug(`${this.getLogPrefix()} Reset already in progress, skipping`);
@@ -206,8 +211,8 @@ export abstract class BasePermissionHandler {
 
         try {
             // Snapshot pending requests to avoid Map mutation during iteration
-            const pendingSnapshot = Array.from(this.pendingRequests.entries());
-            this.pendingRequests.clear(); // Clear immediately to prevent new entries being processed
+            const pendingSnapshot = Array.from(this.pendingRequests.entries()).filter(([, request]) => !preserveTools.includes(request.toolName));
+            for (const [id] of pendingSnapshot) this.pendingRequests.delete(id);
 
             // Reject all pending requests from snapshot
             for (const [id, pending] of pendingSnapshot) {
@@ -223,8 +228,13 @@ export abstract class BasePermissionHandler {
                 const pendingRequests = currentState.requests || {};
                 const completedRequests = { ...currentState.completedRequests };
 
-                // Move all pending to completed as canceled
+                const retainedRequests: typeof pendingRequests = {};
+                // Asynchronous questions can outlive the turn that asked them.
                 for (const [id, request] of Object.entries(pendingRequests)) {
+                    if (preserveTools.includes(request.tool)) {
+                        retainedRequests[id] = request;
+                        continue;
+                    }
                     completedRequests[id] = {
                         ...request,
                         completedAt: Date.now(),
@@ -235,7 +245,7 @@ export abstract class BasePermissionHandler {
 
                 return {
                     ...currentState,
-                    requests: {},
+                    requests: retainedRequests,
                     completedRequests
                 };
             });
