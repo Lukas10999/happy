@@ -1,6 +1,7 @@
 import { MarkdownSpan, parseMarkdown } from './parseMarkdown';
+import { MarkdownImage } from './MarkdownImage';
 import * as React from 'react';
-import { Image, Pressable, View, Platform } from 'react-native';
+import { Pressable, View, Platform } from 'react-native';
 import { HorizontalScrollView } from '../HorizontalScrollView';
 import { Gesture, GestureDetector } from 'react-native-gesture-handler';
 import { StyleSheet } from 'react-native-unistyles';
@@ -84,7 +85,9 @@ export const MarkdownView = React.memo((props: {
                     } else if (block.type === 'table') {
                         return <RenderTableBlock headers={block.headers} rows={block.rows} onLinkPress={handleLinkPress} selectable={selectable} key={index} first={index === 0} last={index === blocks.length - 1} />;
                     } else if (block.type === 'image') {
-                        return <RenderImageBlock url={block.url} alt={block.alt} key={index} first={index === 0} last={index === blocks.length - 1} />;
+                        return <View style={[style.imageBlock, index === 0 && style.first, index === blocks.length - 1 && style.last]} key={index}>
+                            <MarkdownImage url={block.url} alt={block.alt} sessionId={props.sessionId} />
+                        </View>;
                     } else {
                         return null;
                     }
@@ -208,24 +211,6 @@ function RenderCodeBlock(props: { content: string, language: string | null, firs
                     <Text style={style.copyButtonText}>{t('common.copy')}</Text>
                 </Pressable>
             </View>
-        </View>
-    );
-}
-
-function RenderImageBlock(props: { url: string, alt: string, first: boolean, last: boolean }) {
-    const accessibleLabel = props.alt || 'Markdown image';
-
-    return (
-        <View style={[style.imageBlock, props.first && style.first, props.last && style.last]}>
-            <Image
-                source={{ uri: props.url }}
-                style={style.image}
-                accessibilityLabel={accessibleLabel}
-                resizeMode="contain"
-            />
-            {props.alt ? (
-                <Text style={style.imageCaption}>{props.alt}</Text>
-            ) : null}
         </View>
     );
 }
@@ -541,19 +526,6 @@ const style = StyleSheet.create((theme) => ({
         marginVertical: 8,
         alignSelf: 'flex-start',
         gap: 8,
-    },
-    image: {
-        width: '100%',
-        minHeight: 160,
-        height: 240,
-        borderRadius: 12,
-        backgroundColor: theme.colors.surfaceHighest,
-    },
-    imageCaption: {
-        ...Typography.default(),
-        fontSize: 14,
-        lineHeight: 20,
-        color: theme.colors.textSecondary,
     },
     copyButtonContainer: {
         position: 'absolute',
