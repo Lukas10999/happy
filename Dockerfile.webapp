@@ -8,6 +8,8 @@ WORKDIR /repo
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
 COPY scripts ./scripts
 COPY patches ./patches
+# Exercise dependency lookup before installation: pnpm uses isolated siblings.
+RUN node --test patches/fix-virtualized-list-install.test.cjs
 
 RUN mkdir -p packages/happy-app packages/happy-wire
 
