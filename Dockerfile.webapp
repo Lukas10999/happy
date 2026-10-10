@@ -48,6 +48,7 @@ COPY packages/happy-wire ./packages/happy-wire
 COPY packages/happy-app ./packages/happy-app
 
 RUN pnpm --filter @slopus/happy-wire build
+RUN pnpm --filter happy-app exec vitest run sources/components/markdown/resolveMarkdownImage.test.ts sources/components/markdown/parseMarkdown.test.ts sources/components/markdown/linkUtils.test.ts
 RUN pnpm --filter happy-app exec expo export --platform web --output-dir dist
 
 # Stage 3: runtime with Nginx
